@@ -474,11 +474,11 @@ jobs:
          if: env.UPLOAD_ARTIFACT == 'true'
          uses: actions/upload-artifact@master
          with:
-           name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
+           name: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.ipa
            path: flutter/build/ios/ipa/*.ipa
 
        - name: Publish ipa package
-       if: env.UPLOAD_ARTIFACT == 'true'
+         if: env.UPLOAD_ARTIFACT == 'true'
          uses: softprops/action-gh-release@v1
          with:
            prerelease: true
