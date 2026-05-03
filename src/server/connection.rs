@@ -27,6 +27,7 @@ use hbb_common::platform::linux::run_cmds;
 #[cfg(target_os = "android")]
 use hbb_common::protobuf::EnumOrUnknown;
 use hbb_common::{
+    config::decode_permanent_password_h1_from_storage,
     config::{self, keys, Config, TrustedDevice},
     fs::{self, can_enable_overwrite_detection, JobType},
     futures::{SinkExt, StreamExt},
@@ -75,6 +76,18 @@ lazy_static::lazy_static! {
     static ref SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
     static ref WAKELOCK_SENDER: Arc::<Mutex<std::sync::mpsc::Sender<(usize, usize)>>> = Arc::new(Mutex::new(start_wakelock_thread()));
     static ref WAKELOCK_KEEP_AWAKE_OPTION: Arc::<Mutex<Option<bool>>> = Default::default();
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    // Avoid data-dependent early exits.
+    let mut x: u8 = 0;
+    for i in 0..a.len() {
+        x |= a[i] ^ b[i];
+    }
+    x == 0
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -228,6 +241,7 @@ pub struct Connection {
     restart: bool,
     recording: bool,
     block_input: bool,
+    privacy_mode: bool,
     control_permissions: Option<ControlPermissions>,
     last_test_delay: Option<Instant>,
     network_delay: u32,
@@ -418,6 +432,7 @@ impl Connection {
             restart: Self::permission(keys::OPTION_ENABLE_REMOTE_RESTART, &control_permissions),
             recording: Self::permission(keys::OPTION_ENABLE_RECORD_SESSION, &control_permissions),
             block_input: Self::permission(keys::OPTION_ENABLE_BLOCK_INPUT, &control_permissions),
+            privacy_mode: Self::permission(keys::OPTION_ENABLE_PRIVACY_MODE, &control_permissions),
             control_permissions,
             last_test_delay: None,
             network_delay: 0,
@@ -513,6 +528,9 @@ impl Connection {
         }
         if !conn.block_input {
             conn.send_permission(Permission::BlockInput, false).await;
+        }
+        if !conn.privacy_mode {
+            conn.send_permission(Permission::PrivacyMode, false).await;
         }
         let mut test_delay_timer =
             crate::rustdesk_interval(time::interval_at(Instant::now(), TEST_DELAY_TIMEOUT));
@@ -661,6 +679,46 @@ impl Connection {
                             } else if &name == "block_input" {
                                 conn.block_input = enabled;
                                 conn.send_permission(Permission::BlockInput, enabled).await;
+                            } else if &name == "privacy_mode" {
+                                // Keep permission state and runtime state consistent:
+                                // when revoking the permission, try to leave privacy mode first.
+                                // Otherwise we could end up in an inconsistent state where
+                                // permission looks disabled while privacy mode is still active.
+                                if !enabled && privacy_mode::is_in_privacy_mode() {
+                                    if let Some(conn_id) = privacy_mode::get_privacy_mode_conn_id() {
+                                        if conn_id == conn.inner.id() {
+                                            let impl_key =
+                                                privacy_mode::get_cur_impl_key().unwrap_or_default();
+                                            let turn_off_res =
+                                                privacy_mode::turn_off_privacy(conn_id, None);
+                                            match turn_off_res {
+                                                Some(Ok(_)) => {
+                                                    let msg_out = crate::common::make_privacy_mode_msg(
+                                                        back_notification::PrivacyModeState::PrvOffByPeer,
+                                                        impl_key.clone(),
+                                                    );
+                                                    conn.send(msg_out).await;
+                                                }
+                                                _ => {
+                                                    let msg_out = Self::turn_off_privacy_result_to_msg(
+                                                        turn_off_res,
+                                                        impl_key,
+                                                    );
+                                                    conn.send(msg_out).await;
+                                                    // Turn-off failed, so revert CM's optimistic toggle
+                                                    // and keep the previous permission value.
+                                                    conn.send_to_cm(ipc::Data::SwitchPermission {
+                                                        name: "privacy_mode".to_owned(),
+                                                        enabled: conn.privacy_mode,
+                                                    });
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                conn.privacy_mode = enabled;
+                                conn.send_permission(Permission::PrivacyMode, enabled).await;
                             }
                         }
                         ipc::Data::RawMessage(bytes) => {
@@ -965,7 +1023,7 @@ impl Connection {
 
         if let Some(video_privacy_conn_id) = privacy_mode::get_privacy_mode_conn_id() {
             if video_privacy_conn_id == id {
-                let _ = Self::turn_off_privacy_to_msg(id);
+                let _ = Self::turn_off_privacy_to_msg(id, String::new());
             }
         }
         #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
@@ -1887,6 +1945,7 @@ impl Connection {
             restart: self.restart,
             recording: self.recording,
             block_input: self.block_input,
+            privacy_mode: self.privacy_mode,
             from_switch: self.from_switch,
         });
     }
@@ -1969,34 +2028,135 @@ impl Connection {
         self.tx_input.send(MessageInput::Key((msg, press))).ok();
     }
 
-    fn validate_one_password(&self, password: String) -> bool {
-        if password.len() == 0 {
-            return false;
-        }
-        let mut hasher = Sha256::new();
-        hasher.update(password);
-        hasher.update(&self.hash.salt);
+    fn verify_h1(&self, h1: &[u8]) -> bool {
         let mut hasher2 = Sha256::new();
-        hasher2.update(&hasher.finalize()[..]);
-        hasher2.update(&self.hash.challenge);
-        hasher2.finalize()[..] == self.lr.password[..]
+        hasher2.update(h1);
+        hasher2.update(self.hash.challenge.as_bytes());
+        // A normal `==` on slices may short-circuit on the first mismatch, which can leak how many leading
+        // bytes matched via timing. In typical remote scenarios this is difficult to exploit due to network
+        // jitter, changing challenges, and login attempt throttling, but a constant-time comparison here is
+        // low-cost defensive programming.
+        constant_time_eq(&hasher2.finalize()[..], &self.lr.password[..])
     }
 
-    fn validate_password(&mut self) -> bool {
+    fn validate_password_plain(&self, password: &str) -> bool {
+        if password.is_empty() {
+            return false;
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(password.as_bytes());
+        hasher.update(self.hash.salt.as_bytes());
+        let h1_plain = hasher.finalize();
+        self.verify_h1(&h1_plain[..])
+    }
+
+    fn validate_password_storage(&self, storage: &str) -> bool {
+        if storage.is_empty() {
+            return false;
+        }
+
+        // Use strict decode success to detect hashed storage.
+        // If decode fails, treat as legacy plaintext storage for compatibility.
+        if let Some(h1) = decode_permanent_password_h1_from_storage(storage) {
+            return self.verify_h1(&h1[..]);
+        }
+
+        // Legacy plaintext storage path.
+        self.validate_password_plain(storage)
+    }
+
+    // This is coarse brute-force protection for the current temporary password value.
+    // We only care whether the active temporary password itself was presented correctly,
+    // not whether later authorization steps succeed. A successful temporary-password
+    // match clears this state immediately, and the counter also resets whenever the
+    // temporary password changes or is rotated.
+    fn check_update_temporary_password(&self, temporary_password_success: bool) {
+        const MAX_CONSECUTIVE_FAILURES: i32 = 10;
+        #[derive(Default)]
+        struct State {
+            password: String,
+            failures: i32,
+        }
+        lazy_static::lazy_static! {
+            static ref TEMPORARY_PASSWORD_FAILURES: Mutex<State> =
+                Mutex::new(State::default());
+        }
+
+        if !password::temporary_enabled() {
+            return;
+        }
+
+        let mut state = TEMPORARY_PASSWORD_FAILURES.lock().unwrap();
+        let current_password = password::temporary_password();
+        if current_password.is_empty() {
+            return;
+        }
+        if state.password != current_password {
+            state.password = current_password;
+            state.failures = 0;
+        }
+
+        if temporary_password_success {
+            state.failures = 0;
+            return;
+        }
+        state.failures += 1;
+
+        if state.failures < MAX_CONSECUTIVE_FAILURES {
+            return;
+        }
+
+        password::update_temporary_password();
+        let new_password = password::temporary_password();
+        log::warn!(
+            "Temporary password rotated after too many consecutive wrong attempts: failures={}, ip={}",
+            state.failures,
+            self.ip,
+        );
+        state.password = new_password;
+        state.failures = 0;
+    }
+
+    fn validate_password(&mut self, allow_permanent_password: bool) -> bool {
         if password::temporary_enabled() {
             let password = password::temporary_password();
-            if self.validate_one_password(password.clone()) {
+            if self.validate_password_plain(&password) {
                 raii::AuthedConnID::update_or_insert_session(
                     self.session_key(),
                     Some(password),
                     Some(false),
                 );
+                self.check_update_temporary_password(true);
                 return true;
             }
         }
-        if password::permanent_enabled() {
-            if self.validate_one_password(Config::get_permanent_password()) {
-                return true;
+        if password::permanent_enabled() || allow_permanent_password {
+            let print_fallback = || {
+                if allow_permanent_password && !password::permanent_enabled() {
+                    log::info!("Permanent password accepted via logon-screen fallback");
+                }
+            };
+            // Since hashed storage uses a prefix-based encoding, a hard plaintext that
+            // happens to look like hashed storage could be mis-detected. Validate local storage
+            // and hard/preset plaintext via separate paths to avoid that ambiguity.
+            let (local_storage, _) = Config::get_local_permanent_password_storage_and_salt();
+            if !local_storage.is_empty() {
+                if self.validate_password_storage(&local_storage) {
+                    print_fallback();
+                    return true;
+                }
+            } else {
+                let hard = config::HARD_SETTINGS
+                    .read()
+                    .unwrap()
+                    .get("password")
+                    .cloned()
+                    .unwrap_or_default();
+                if !hard.is_empty() && self.validate_password_plain(&hard) {
+                    print_fallback();
+                    return true;
+                }
             }
         }
         false
@@ -2016,7 +2176,7 @@ impl Connection {
         if let Some(session) = session {
             if !self.lr.password.is_empty()
                 && (tfa && session.tfa
-                    || !tfa && self.validate_one_password(session.random_password.clone()))
+                    || !tfa && self.validate_password_plain(&session.random_password))
             {
                 log::info!("is recent session");
                 return true;
@@ -2061,6 +2221,7 @@ impl Connection {
                 keys::OPTION_ENABLE_REMOTE_RESTART => Some(Permission::restart),
                 keys::OPTION_ENABLE_RECORD_SESSION => Some(Permission::recording),
                 keys::OPTION_ENABLE_BLOCK_INPUT => Some(Permission::block_input),
+                keys::OPTION_ENABLE_PRIVACY_MODE => Some(Permission::privacy_mode),
                 _ => None,
             };
             if let Some(permission) = permission {
@@ -2290,6 +2451,10 @@ impl Connection {
             #[cfg(any(target_os = "android", target_os = "ios"))]
             let is_logon = || crate::platform::is_prelogin();
 
+            let allow_logon_screen_password =
+                crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
+                    && is_logon();
+
             if !hbb_common::is_ip_str(&lr.username)
                 && !hbb_common::is_domain_port_str(&lr.username)
                 && lr.username != Config::get_id()
@@ -2298,8 +2463,7 @@ impl Connection {
                     .await;
                 return false;
             } else if (password::approve_mode() == ApproveMode::Click
-                && !(crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
-                    && is_logon()))
+                && !allow_logon_screen_password)
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
             {
                 self.try_start_cm(lr.my_id, lr.my_name, false);
@@ -2335,8 +2499,9 @@ impl Connection {
                 if !res {
                     return true;
                 }
-                if !self.validate_password() {
+                if !self.validate_password(allow_logon_screen_password) {
                     self.update_failure(failure, false, 0);
+                    self.check_update_temporary_password(false);
                     if err_msg.is_empty() {
                         self.send_login_error(crate::client::LOGIN_MSG_PASSWORD_WRONG)
                             .await;
@@ -4027,6 +4192,15 @@ impl Connection {
     }
 
     async fn turn_on_privacy(&mut self, impl_key: String) {
+        if !self.is_authed_remote_conn() || !self.privacy_mode {
+            let msg_out = crate::common::make_privacy_mode_msg(
+                back_notification::PrivacyModeState::PrvOnFailedDenied,
+                impl_key,
+            );
+            self.send(msg_out).await;
+            return;
+        }
+
         let msg_out = if !privacy_mode::is_privacy_mode_supported() {
             crate::common::make_privacy_mode_msg_with_details(
                 back_notification::PrivacyModeState::PrvNotSupported,
@@ -4068,7 +4242,7 @@ impl Connection {
                                 "Check privacy mode failed: {}, turn off privacy mode.",
                                 &err_msg
                             );
-                            let _ = Self::turn_off_privacy_to_msg(self.inner.id);
+                            let _ = Self::turn_off_privacy_to_msg(self.inner.id, String::new());
                             crate::common::make_privacy_mode_msg_with_details(
                                 back_notification::PrivacyModeState::PrvOnFailed,
                                 err_msg,
@@ -4087,6 +4261,7 @@ impl Connection {
                     if privacy_mode::is_in_privacy_mode() {
                         let _ = Self::turn_off_privacy_to_msg(
                             privacy_mode::INVALID_PRIVACY_MODE_CONN_ID,
+                            String::new(),
                         );
                     }
                     crate::common::make_privacy_mode_msg_with_details(
@@ -4114,14 +4289,23 @@ impl Connection {
                 impl_key,
             )
         } else {
-            Self::turn_off_privacy_to_msg(self.inner.id)
+            Self::turn_off_privacy_to_msg(self.inner.id, impl_key)
         };
         self.send(msg_out).await;
     }
 
-    pub fn turn_off_privacy_to_msg(_conn_id: i32) -> Message {
-        let impl_key = "".to_owned();
-        match privacy_mode::turn_off_privacy(_conn_id, None) {
+    pub fn turn_off_privacy_to_msg(_conn_id: i32, impl_key: String) -> Message {
+        Self::turn_off_privacy_result_to_msg(
+            privacy_mode::turn_off_privacy(_conn_id, None),
+            impl_key,
+        )
+    }
+
+    fn turn_off_privacy_result_to_msg(
+        turn_off_res: Option<hbb_common::ResultType<()>>,
+        impl_key: String,
+    ) -> Message {
+        match turn_off_res {
             Some(Ok(_)) => crate::common::make_privacy_mode_msg(
                 back_notification::PrivacyModeState::PrvOffSucceeded,
                 impl_key,
