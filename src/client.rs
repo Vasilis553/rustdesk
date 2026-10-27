@@ -857,7 +857,7 @@ impl Client {
         };
 
         let switch_code = interface.get_switch_code();
-        //let legacy_secure = !key.is_empty() && (!token.is_empty() || !switch_code.is_empty());
+        let legacy_secure = !key.is_empty() && (!token.is_empty() || !switch_code.is_empty());
         let carries_offer = webrtc_offerer.as_ref().and_then(|g| g.stream()).is_some();
         // Counted from before the key exchange, so the exchange spends the UDP NAT test's own
         // wait rather than replacing it: the test runs beside both.
@@ -884,18 +884,18 @@ impl Client {
                 }
             }
         }
-        /*
+        
         if !exchanged && legacy_secure {
             secure_tcp(&mut socket, &key)
                 .await
                 .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
         }
-        */
+        
         // A token or switch code has always taken this socket straight to the punch without
         // waiting for the UDP NAT test. The WebRTC exchange does not replace that wait, it only
         // spends part of the same budget, so what is left of it is waited out here and a result
         // that has already arrived is taken at once.
-        /*
+        
         if let Some(udp) = udp.1.as_ref().filter(|_| !legacy_secure) {
             let tm = udp_nat_wait_from;
             // rtt is the TCP connect time. When it is too short to be a real WAN round trip it
@@ -917,7 +917,7 @@ impl Client {
                 hbb_common::sleep(0.001).await;
             }
         }
-        */
+        
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
         let mut msg_out = RendezvousMessage::new();
@@ -1808,11 +1808,11 @@ impl Client {
             let mut socket = connect_tcp(rendezvous_server, CONNECT_TIMEOUT)
                 .await
                 .with_context(|| "Failed to connect to rendezvous server")?;
-/*
+
             if !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {
                 secure_tcp(&mut socket, key).await?;
             }
-*/
+
             ipv4 = socket.local_addr().is_ipv4();
             let mut msg_out = RendezvousMessage::new();
             uuid = Uuid::new_v4().to_string();
