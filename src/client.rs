@@ -884,15 +884,18 @@ impl Client {
                 }
             }
         }
+        
         if !exchanged && legacy_secure {
             secure_tcp(&mut socket, &key)
                 .await
                 .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
         }
+        
         // A token or switch code has always taken this socket straight to the punch without
         // waiting for the UDP NAT test. The WebRTC exchange does not replace that wait, it only
         // spends part of the same budget, so what is left of it is waited out here and a result
         // that has already arrived is taken at once.
+        
         if let Some(udp) = udp.1.as_ref().filter(|_| !legacy_secure) {
             let tm = udp_nat_wait_from;
             // rtt is the TCP connect time. When it is too short to be a real WAN round trip it
@@ -914,6 +917,7 @@ impl Client {
                 hbb_common::sleep(0.001).await;
             }
         }
+        
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
         let mut msg_out = RendezvousMessage::new();
